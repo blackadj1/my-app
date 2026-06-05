@@ -1,5 +1,5 @@
 pipeline {
-    // 1. [AKS 전용 구성] TCP 통신 및 vfs 드라이버 강제 적용
+    // 1. [AKS 표준 설정] 컨테이너 분리 및 vfs 드라이버 적용
     agent {
         kubernetes {
             yaml '''
@@ -15,7 +15,6 @@ spec:
     command:
     - cat
     tty: true
-    # 로컬 네트워크 루프백으로 dind 데몬에 연결합니다 (볼륨 마운트 필요 없음!)
     env:
     - name: DOCKER_HOST
       value: tcp://localhost:2375
@@ -25,7 +24,6 @@ spec:
       privileged: true
     command:
     - dockerd-entrypoint.sh
-    # vfs 드라이버와 TLS 미사용 설정을 주입해 AKS에서 오류 없이 데몬이 켜지게 만듭니다.
     args:
     - --storage-driver=vfs
     - --host=tcp://0.0.0.0:2375
@@ -46,7 +44,7 @@ spec:
 
         MANIFEST_REPO_URL = 'github.com/blackadj1/manifest-repo-test.git'
         
-        // 젠킨스 일감 이름(my-app)을 자동으로 완벽하게 매핑합니다.
+        // [수정 완료] 젠킨스 일감 이름인 'my-app'을 시스템 전역 변수에서 바로 주입합니다. (에러 원천 차단)
         IMAGE_NAME        = "${env.JOB_BASE_NAME}"
     }
     
@@ -56,21 +54,26 @@ spec:
             steps {
                 container('docker') {
                     sh """
-                        # [대기 루프] 도커 데몬이 완전히 켜져서 준비될 때까지 기다립니다.
+                        # [대기 루프] 알핀 Linux에서도 100% 호환되는 POSIX while 문법 적용
                         echo "============================================="
                         echo "Docker 데몬이 준비될 때까지 대기합니다..."
                         echo "============================================="
-                        for i in {1..15}; do
+                        attempt=1
+                        while [ \$attempt -le 15 ]; do
                             if docker info >/dev/null 2>&1; then
-                                echo "Docker 데몬이 준비되었습니다!"
+                                echo "Docker 데몬이 성공적으로 준비되었습니다!"
                                 break
                             fi
-                            echo "Docker 데몬 응답 없음 (시도 \${i}/15). 2초 후 재시도..."
+                            echo "Docker 데몬 응답 없음 (시도 \${attempt}/15). 2초 후 재시도..."
+                            attempt=\$((attempt + 1))
                             sleep 2
                         done
 
-                        apk add --no-cache git
-                        
+                        if [ \$attempt -gt 15 ]; then
+                            echo "에러: 30초 동안 Docker 데몬이 작동하지 않았습니다."
+                            exit 1
+                        fi
+
                         # ACR 로그인 및 이미지 빌드/푸시
                         docker login ${REGISTRY_URL} -u ${ACR_ADMIN_USER} -p ${ACR_ADMIN_PASS}
                         docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
@@ -90,7 +93,7 @@ spec:
                         cd manifest-temp
                         
                         # deployment.yaml의 이미지 정보 치환
-                        sed -i "s|image: ${REGISTRY_URL}/${IMAGE_NAME}:.*|image: ${REGISTRY_URL}/${env.IMAGE_NAME}:${IMAGE_TAG}|g" ${IMAGE_NAME}/deployment.yaml
+                        sed -i "s|image: ${REGISTRY_URL}/${IMAGE_NAME}:.*|image: ${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}|g" ${IMAGE_NAME}/deployment.yaml
                         
                         git config user.email "jenkins-ci@yourdomain.com"
                         git config user.name "Jenkins CI Bot"
