@@ -1,4 +1,5 @@
 pipeline {
+    // 1. [AKS 전용 구성] TCP 통신 및 vfs 드라이버 강제 적용
     agent {
         kubernetes {
             yaml '''
@@ -14,25 +15,23 @@ spec:
     command:
     - cat
     tty: true
-    # 1. dind와 공유하는 로컬 소켓 볼륨을 마운트합니다.
-    volumeMounts:
-    - mountPath: /var/run
-      name: docker-sock
+    # 로컬 네트워크 루프백으로 dind 데몬에 연결합니다 (볼륨 마운트 필요 없음!)
+    env:
+    - name: DOCKER_HOST
+      value: tcp://localhost:2375
   - name: dind
     image: docker:24-dind
     securityContext:
       privileged: true
+    command:
+    - dockerd-entrypoint.sh
+    # vfs 드라이버와 TLS 미사용 설정을 주입해 AKS에서 오류 없이 데몬이 켜지게 만듭니다.
+    args:
+    - --storage-driver=vfs
+    - --host=tcp://0.0.0.0:2375
     env:
     - name: DOCKER_TLS_CERTDIR
       value: ""
-    # 2. 로컬 소켓을 생성할 공유 볼륨을 마운트합니다.
-    volumeMounts:
-    - mountPath: /var/run
-      name: docker-sock
-  # 3. 컨테이너들이 내부 소켓 파일(docker.sock)을 공유할 수 있도록 emptyDir 선언
-  volumes:
-  - name: docker-sock
-    emptyDir: {}
 '''
         }
     }
@@ -47,7 +46,7 @@ spec:
 
         MANIFEST_REPO_URL = 'github.com/blackadj1/manifest-repo-test.git'
         
-        // [수정 완료] 젠킨스 일감 이름(my-app)을 변수 정의 단계에서 100% 안전하게 직접 주입합니다.
+        // 젠킨스 일감 이름(my-app)을 자동으로 완벽하게 매핑합니다.
         IMAGE_NAME        = "${env.JOB_BASE_NAME}"
     }
     
@@ -57,10 +56,23 @@ spec:
             steps {
                 container('docker') {
                     sh """
-                        # 1. ACR 관리자 계정으로 로그인 (로컬 소켓을 공유하므로 TCP 없이 완벽 작동)
-                        docker login ${REGISTRY_URL} -u ${ACR_ADMIN_USER} -p ${ACR_ADMIN_PASS}
+                        # [대기 루프] 도커 데몬이 완전히 켜져서 준비될 때까지 기다립니다.
+                        echo "============================================="
+                        echo "Docker 데몬이 준비될 때까지 대기합니다..."
+                        echo "============================================="
+                        for i in {1..15}; do
+                            if docker info >/dev/null 2>&1; then
+                                echo "Docker 데몬이 준비되었습니다!"
+                                break
+                            fi
+                            echo "Docker 데몬 응답 없음 (시도 \${i}/15). 2초 후 재시도..."
+                            sleep 2
+                        done
+
+                        apk add --no-cache git
                         
-                        # 2. 이미지 빌드 및 ACR 푸시
+                        # ACR 로그인 및 이미지 빌드/푸시
+                        docker login ${REGISTRY_URL} -u ${ACR_ADMIN_USER} -p ${ACR_ADMIN_PASS}
                         docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
                         docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}
                         docker push ${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}
@@ -78,7 +90,7 @@ spec:
                         cd manifest-temp
                         
                         # deployment.yaml의 이미지 정보 치환
-                        sed -i "s|image: ${REGISTRY_URL}/${IMAGE_NAME}:.*|image: ${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}|g" ${IMAGE_NAME}/deployment.yaml
+                        sed -i "s|image: ${REGISTRY_URL}/${IMAGE_NAME}:.*|image: ${REGISTRY_URL}/${env.IMAGE_NAME}:${IMAGE_TAG}|g" ${IMAGE_NAME}/deployment.yaml
                         
                         git config user.email "jenkins-ci@yourdomain.com"
                         git config user.name "Jenkins CI Bot"
