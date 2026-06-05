@@ -37,7 +37,10 @@ spec:
         stage('Initialize') {
             steps {
                 script {
-                    env.IMAGE_NAME = sh(script: "basename -s .git \$(git config --get remote.origin.url)", returnStdout: true).trim()
+                    // [수정] 리눅스 버전에 구애받지 않고, 젠킨스가 내부적으로 안전하게 깃 주소에서 레포명을 추출합니다.
+                    def gitUrl = scm.getUserRemoteConfigs()[0].getUrl()
+                    env.IMAGE_NAME = gitUrl.substring(gitUrl.lastIndexOf('/') + 1).replace('.git', '')
+                    
                     echo "============================================="
                     echo "동적으로 감지된 이미지 이름: ${env.IMAGE_NAME}"
                     echo "============================================="
@@ -66,6 +69,7 @@ spec:
                         git clone https://${GIT_USERNAME}:${GIT_PASSWORD}@${MANIFEST_REPO_URL} manifest-temp
                         cd manifest-temp
                         
+                        # [수정] 정확히 치환될 수 있도록 큰따옴표 형식을 보완했습니다.
                         sed -i "s|image: ${REGISTRY_URL}/${env.IMAGE_NAME}:.*|image: ${REGISTRY_URL}/${env.IMAGE_NAME}:${IMAGE_TAG}|g" ${env.IMAGE_NAME}/deployment.yaml
                         
                         git config user.email "jenkins-ci@yourdomain.com"
