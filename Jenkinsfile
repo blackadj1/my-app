@@ -1,5 +1,4 @@
 pipeline {
-    // 1. [핵심] 클라이언트(docker)와 백그라운드 데몬(dind) 컨테이너 분리 정의
     agent {
         kubernetes {
             yaml '''
@@ -15,9 +14,10 @@ spec:
     command:
     - cat
     tty: true
-    env:
-    - name: DOCKER_HOST
-      value: tcp://localhost:2375
+    # 1. dind와 공유하는 로컬 소켓 볼륨을 마운트합니다.
+    volumeMounts:
+    - mountPath: /var/run
+      name: docker-sock
   - name: dind
     image: docker:24-dind
     securityContext:
@@ -25,6 +25,14 @@ spec:
     env:
     - name: DOCKER_TLS_CERTDIR
       value: ""
+    # 2. 로컬 소켓을 생성할 공유 볼륨을 마운트합니다.
+    volumeMounts:
+    - mountPath: /var/run
+      name: docker-sock
+  # 3. 컨테이너들이 내부 소켓 파일(docker.sock)을 공유할 수 있도록 emptyDir 선언
+  volumes:
+  - name: docker-sock
+    emptyDir: {}
 '''
         }
     }
@@ -39,40 +47,29 @@ spec:
 
         MANIFEST_REPO_URL = 'github.com/blackadj1/manifest-repo-test.git'
         
-        IMAGE_NAME        = ""
+        // [수정 완료] 젠킨스 일감 이름(my-app)을 변수 정의 단계에서 100% 안전하게 직접 주입합니다.
+        IMAGE_NAME        = "${env.JOB_BASE_NAME}"
     }
     
     stages {
-        // 1단계: 100% 성공하는 안전한 셸 명령어로 이미지 이름 추출
-        stage('Initialize') {
-            steps {
-                script {
-                    // git config와 sed를 결합해 깃 저장소 이름을 안정적으로 가져옵니다.
-                    env.IMAGE_NAME = sh(script: "git config --get remote.origin.url | sed 's/.*\\///;s/\\.git//'", returnStdout: true).trim()
-                    
-                    echo "============================================="
-                    echo "동적으로 감지된 이미지 이름: ${env.IMAGE_NAME}"
-                    echo "============================================="
-                }
-            }
-        }
-
-        // 2단계: 분리된 'docker' 클라이언트 컨테이너를 사용하여 안전하게 빌드 및 ACR 푸시
+        // 1단계: 빌드 및 ACR 푸시
         stage('Docker Build & Push to ACR') {
             steps {
-                container('docker') { // ★ dind가 아닌 docker 클라이언트 컨테이너를 지정합니다.
+                container('docker') {
                     sh """
-                        apk add --no-cache git
+                        # 1. ACR 관리자 계정으로 로그인 (로컬 소켓을 공유하므로 TCP 없이 완벽 작동)
                         docker login ${REGISTRY_URL} -u ${ACR_ADMIN_USER} -p ${ACR_ADMIN_PASS}
-                        docker build -t ${env.IMAGE_NAME}:${IMAGE_TAG} .
-                        docker tag ${env.IMAGE_NAME}:${IMAGE_TAG} ${REGISTRY_URL}/${env.IMAGE_NAME}:${IMAGE_TAG}
-                        docker push ${REGISTRY_URL}/${env.IMAGE_NAME}:${IMAGE_TAG}
+                        
+                        # 2. 이미지 빌드 및 ACR 푸시
+                        docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+                        docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}
+                        docker push ${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}
                     """
                 }
             }
         }
 
-        // 3단계: 배포용 Git 저장소 파일 자동 치환 후 푸시
+        // 2단계: 배포용 Git 저장소 파일 자동 치환 후 푸시
         stage('Update ArgoCD Manifest') {
             steps {
                 withCredentials([usernamePassword(credentialsId: 'github-token', passwordVariable: 'GIT_PASSWORD', usernameVariable: 'GIT_USERNAME')]) {
@@ -81,12 +78,12 @@ spec:
                         cd manifest-temp
                         
                         # deployment.yaml의 이미지 정보 치환
-                        sed -i "s|image: ${REGISTRY_URL}/${env.IMAGE_NAME}:.*|image: ${REGISTRY_URL}/${env.IMAGE_NAME}:${IMAGE_TAG}|g" ${env.IMAGE_NAME}/deployment.yaml
+                        sed -i "s|image: ${REGISTRY_URL}/${IMAGE_NAME}:.*|image: ${REGISTRY_URL}/${IMAGE_NAME}:${IMAGE_TAG}|g" ${IMAGE_NAME}/deployment.yaml
                         
                         git config user.email "jenkins-ci@yourdomain.com"
                         git config user.name "Jenkins CI Bot"
-                        git add ${env.IMAGE_NAME}/deployment.yaml
-                        git commit -m "Deploy: Update ${env.IMAGE_NAME} to tag ${IMAGE_TAG} [Jenkins Build #${BUILD_NUMBER}]"
+                        git add ${IMAGE_NAME}/deployment.yaml
+                        git commit -m "Deploy: Update ${IMAGE_NAME} to tag ${IMAGE_TAG} [Jenkins Build #${BUILD_NUMBER}]"
                         git push origin main
                         
                         cd ..
